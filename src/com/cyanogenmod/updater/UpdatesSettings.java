@@ -84,6 +84,11 @@ public class UpdatesSettings extends PreferenceActivity implements
 
     private static final int PERMISSIONS_REQUEST_WRITE_EXTERNAL_STORAGE = 1;
 
+    private static final int PERMISSIONS_REQUEST_FOR_DOWNLOAD = 0;
+    private static final int PERMISSIONS_REQUEST_FOR_DELETE_ZIP = 1;
+    private static final int PERMISSIONS_REQUEST_FOR_DELETE_ALL = 2;
+    private static final int PERMISSIONS_REQUEST_FOR_READ_DIR = 3;
+
     private SharedPreferences mPrefs;
     private ListPreference mUpdateCheck;
 
@@ -98,7 +103,12 @@ public class UpdatesSettings extends PreferenceActivity implements
     private DownloadManager mDownloadManager;
     private boolean mDownloading = false;
     private long mDownloadId;
-    private String mFileName;
+    private String mDownloadFileName;
+
+    private String mDeleteFileName = "";
+
+    private int mPermissionsReqType;
+    private boolean mPermissionsReqInProgress = false;
 
     private Handler mUpdateHandler = new Handler();
 
@@ -124,7 +134,7 @@ public class UpdatesSettings extends PreferenceActivity implements
                                 Toast.LENGTH_LONG).show();
                     }
                 }
-                updateLayout();
+                requestUpdateLayout();
             }
         }
     };
@@ -170,6 +180,11 @@ public class UpdatesSettings extends PreferenceActivity implements
 
             // Turn on the Options Menu
             invalidateOptionsMenu();
+        }
+
+        // If running on a phone, remove padding around the listview
+        if (!ScreenType.isTablet(this)) {
+            getListView().setPadding(0, 0, 0, 0);
         }
     }
 
@@ -227,7 +242,7 @@ public class UpdatesSettings extends PreferenceActivity implements
 
         // Check if we need to refresh the screen to show new updates
         if (intent.getBooleanExtra(EXTRA_UPDATE_LIST_UPDATED, false)) {
-            updateLayout();
+            requestUpdateLayout();
         }
 
         checkForDownloadCompleted(intent);
@@ -278,18 +293,18 @@ public class UpdatesSettings extends PreferenceActivity implements
                 if (status == DownloadManager.STATUS_PENDING
                         || status == DownloadManager.STATUS_RUNNING
                         || status == DownloadManager.STATUS_PAUSED) {
-                    mFileName = uri.getLastPathSegment();
+                    mDownloadFileName = uri.getLastPathSegment();
                 }
             }
             if (c != null) {
                 c.close();
             }
         }
-        if (mDownloadId < 0 || mFileName == null) {
+        if (mDownloadId < 0 || mDownloadFileName == null) {
             resetDownloadState();
         }
 
-        updateLayout();
+        requestUpdateLayout();
 
         IntentFilter filter = new IntentFilter(UpdateCheckService.ACTION_CHECK_FINISHED);
         filter.addAction(DownloadReceiver.ACTION_DOWNLOAD_STARTED);
@@ -326,19 +341,8 @@ public class UpdatesSettings extends PreferenceActivity implements
         // We have a match, get ready to trigger the download
         mDownloadingPreference = pref;
 
-        // But check permissions first - download will be started in the callback
-        int permissionCheck = ContextCompat.checkSelfPermission(pref.getContext(),
-                android.Manifest.permission.WRITE_EXTERNAL_STORAGE);
-        if (permissionCheck == PackageManager.PERMISSION_GRANTED) {
-            // permission already granted, start the download
-            startDownload();
-        } else {
-            // permission not granted, request it from the user
-            ActivityCompat.requestPermissions(this,
-                    new String[]{android.Manifest.permission.WRITE_EXTERNAL_STORAGE},
-                    PERMISSIONS_REQUEST_WRITE_EXTERNAL_STORAGE);
-        }
-
+        mPermissionsReqType = PERMISSIONS_REQUEST_FOR_DOWNLOAD;
+        requestStoragePermission(pref.getContext());
     }
 
     private Runnable mUpdateProgress = new Runnable() {
@@ -410,7 +414,7 @@ public class UpdatesSettings extends PreferenceActivity implements
 
     @Override
     public void onStopDownload(final UpdatePreference pref) {
-        if (!mDownloading || mFileName == null || mDownloadId < 0) {
+        if (!mDownloading || mDownloadFileName == null || mDownloadId < 0) {
             pref.setStyle(UpdatePreference.STYLE_NEW);
             resetDownloadState();
             return;
@@ -489,7 +493,7 @@ public class UpdatesSettings extends PreferenceActivity implements
 
     private void resetDownloadState() {
         mDownloadId = -1;
-        mFileName = null;
+        mDownloadFileName = null;
         mDownloading = false;
         mDownloadingPreference = null;
     }
@@ -539,6 +543,16 @@ public class UpdatesSettings extends PreferenceActivity implements
         mProgressDialog.show();
     }
 
+    private void requestUpdateLayout() {
+        // Clear the notification if one exists
+        Utils.cancelNotification(this);
+
+        if (!mPermissionsReqInProgress) {
+           mPermissionsReqType = PERMISSIONS_REQUEST_FOR_READ_DIR;
+           requestStoragePermission(getApplicationContext());
+        }
+    }
+
     private void updateLayout() {
         // Read existing Updates
         LinkedList<String> existingFiles = new LinkedList<String>();
@@ -553,9 +567,6 @@ public class UpdatesSettings extends PreferenceActivity implements
                 }
             }
         }
-
-        // Clear the notification if one exists
-        Utils.cancelNotification(this);
 
         // Build list of updates
         LinkedList<UpdateInfo> availableUpdates = State.loadState(this);
@@ -587,7 +598,12 @@ public class UpdatesSettings extends PreferenceActivity implements
         new Thread() {
             @Override
             public void run() {
-                File[] files = getCacheDir().listFiles(new UpdateFilter(UpdateInfo.CHANGELOG_EXTENSION));
+                File cacheDir = getCacheDir();
+                if (cacheDir == null) {
+                    return;
+                }
+
+                File[] files = cacheDir.listFiles(new UpdateFilter(UpdateInfo.CHANGELOG_EXTENSION));
                 if (files == null) {
                     return;
                 }
@@ -645,7 +661,7 @@ public class UpdatesSettings extends PreferenceActivity implements
             }
 
             // Determine the preference style and create the preference
-            boolean isDownloading = ui.getFileName().equals(mFileName);
+            boolean isDownloading = ui.getFileName().equals(mDownloadFileName);
             int style;
 
             if (isDownloading) {
@@ -691,13 +707,9 @@ public class UpdatesSettings extends PreferenceActivity implements
         }
     }
 
-    @Override
-    public void onDeleteUpdate(UpdatePreference pref) {
-        final String fileName = pref.getKey();
-
+    private void deleteZipUpdate() {
         if (mUpdateFolder.exists() && mUpdateFolder.isDirectory()) {
-            File zipFileToDelete = new File(mUpdateFolder, fileName);
-
+            File zipFileToDelete = new File(mUpdateFolder, mDeleteFileName);
             if (zipFileToDelete.exists()) {
                 zipFileToDelete.delete();
             } else {
@@ -705,7 +717,7 @@ public class UpdatesSettings extends PreferenceActivity implements
                 return;
             }
 
-            String message = getString(R.string.delete_single_update_success_message, fileName);
+            String message = getString(R.string.delete_single_update_success_message, mDeleteFileName);
             Toast.makeText(this, message, Toast.LENGTH_SHORT).show();
         } else if (!mUpdateFolder.exists()) {
             Toast.makeText(this, R.string.delete_updates_noFolder_message, Toast.LENGTH_SHORT).show();
@@ -714,22 +726,65 @@ public class UpdatesSettings extends PreferenceActivity implements
         }
 
         // Update the list
-        updateLayout();
+        requestUpdateLayout();
+    }
+
+    @Override
+    public void onDeleteUpdate(UpdatePreference pref) {
+        mDeleteFileName = pref.getKey();
+        if (mDeleteFileName.isEmpty()) {
+            Log.e(TAG, "deleteZipUpdate: File name not specified");
+            return;
+        }
+        mPermissionsReqType = PERMISSIONS_REQUEST_FOR_DELETE_ZIP;
+        requestStoragePermission(pref.getContext());
     }
 
     @Override
     public void onRequestPermissionsResult(int requestCode, String permissions[],
                                            int[] grantResults) {
+        mPermissionsReqInProgress = false;
         switch (requestCode) {
             case PERMISSIONS_REQUEST_WRITE_EXTERNAL_STORAGE: {
                 // if request is cancelled, the result arrays are empty
                 if (grantResults.length > 0
                         && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
                     // permission was granted, yay!
-                    startDownload();
+                    switch (mPermissionsReqType) {
+                        case PERMISSIONS_REQUEST_FOR_DOWNLOAD:
+                            startDownload();
+                            break;
+                        case PERMISSIONS_REQUEST_FOR_DELETE_ZIP:
+                            deleteZipUpdate();
+                            break;
+                        case PERMISSIONS_REQUEST_FOR_DELETE_ALL:
+                            deleteOldUpdates();
+                            break;
+                        case PERMISSIONS_REQUEST_FOR_READ_DIR:
+                            updateLayout();
+                            break;
+                        default:
+                            break;
+                    }
                 } else {
-                    // permission was not granted, cannot download
-                    mDownloadingPreference = null;
+                    // permission was not granted
+                    switch (mPermissionsReqType) {
+                        case PERMISSIONS_REQUEST_FOR_DOWNLOAD:
+                            mDownloadingPreference = null;
+                            break;
+                        case PERMISSIONS_REQUEST_FOR_DELETE_ZIP:
+                            mDeleteFileName = "";
+                            Log.e(TAG, "deleteZipUpdate: Permission not granted");
+                            break;
+                        case PERMISSIONS_REQUEST_FOR_DELETE_ALL:
+                            Log.e(TAG, "deleteOldUpdates: Permission not granted");
+                            break;
+                        case PERMISSIONS_REQUEST_FOR_READ_DIR:
+                            Log.e(TAG, "updateLayout: Permission not granted");
+                            break;
+                        default:
+                            break;
+                    }
                     new AlertDialog.Builder(this)
                             .setTitle(R.string.permission_not_granted_dialog_title)
                             .setMessage(R.string.permission_not_granted_dialog_message)
@@ -758,7 +813,7 @@ public class UpdatesSettings extends PreferenceActivity implements
         ImageView updatesButton = mDownloadingPreference.getUpdatesButton();
         updatesButton.setEnabled(false);
 
-        mFileName = ui.getFileName();
+        mDownloadFileName = ui.getFileName();
         mDownloading = true;
 
         // Start the download
@@ -778,17 +833,54 @@ public class UpdatesSettings extends PreferenceActivity implements
                     @Override
                     public void onClick(DialogInterface dialog, int which) {
                         // We are OK to delete, trigger it
-                        deleteOldUpdates();
-                        updateLayout();
+                        mPermissionsReqType = PERMISSIONS_REQUEST_FOR_DELETE_ALL;
+                        requestStoragePermission(getApplicationContext());
                     }
                 })
                 .setNegativeButton(R.string.dialog_cancel, null)
                 .show();
     }
 
+    private void requestStoragePermission(Context context) {
+        int permissionCheck = ContextCompat.checkSelfPermission(context,
+                android.Manifest.permission.WRITE_EXTERNAL_STORAGE);
+        if (permissionCheck == PackageManager.PERMISSION_GRANTED) {
+            // permission already granted, go ahead
+            switch (mPermissionsReqType) {
+                case PERMISSIONS_REQUEST_FOR_DOWNLOAD:
+                    startDownload();
+                    break;
+                case PERMISSIONS_REQUEST_FOR_DELETE_ZIP:
+                    deleteZipUpdate();
+                    break;
+                case PERMISSIONS_REQUEST_FOR_DELETE_ALL:
+                    deleteOldUpdates();
+                    break;
+                case PERMISSIONS_REQUEST_FOR_READ_DIR:
+                    updateLayout();
+                    break;
+                default:
+                    break;
+            }
+        } else {
+            // permission not granted, request it from the user
+            mPermissionsReqInProgress = true;
+            ActivityCompat.requestPermissions(this,
+                    new String[]{android.Manifest.permission.WRITE_EXTERNAL_STORAGE},
+                    PERMISSIONS_REQUEST_WRITE_EXTERNAL_STORAGE);
+        }
+    }
+
     private boolean deleteOldUpdates() {
         boolean success;
-        //mUpdateFolder: Foldername with fullpath of SDCARD
+
+        // If storage permissions have been denied on application start and the first time they
+        // are granted is after choosing "Delete downloads", then updateLayout() will not have
+        // have been called yet to define mUpdateFolder. Set it now to prevent a null exception
+        // when .exists() is called.
+        if (mUpdateFolder == null) {
+            mUpdateFolder = Utils.makeUpdateFolder();
+        }
         if (mUpdateFolder.exists() && mUpdateFolder.isDirectory()) {
             deleteDir(mUpdateFolder);
             mUpdateFolder.mkdir();
@@ -801,12 +893,18 @@ public class UpdatesSettings extends PreferenceActivity implements
             success = false;
             Toast.makeText(this, R.string.delete_updates_failure_message, Toast.LENGTH_SHORT).show();
         }
+        requestUpdateLayout();
         return success;
     }
 
     private static boolean deleteDir(File dir) {
         if (dir.isDirectory()) {
             String[] children = dir.list();
+            if (children == null) {
+                // An IO or permissions failure; don't crash
+                Log.e(TAG, "deleteDir: dir.list() failed, check storage permissions");
+                return false;
+            }
             for (String aChildren : children) {
                 boolean success = deleteDir(new File(dir, aChildren));
                 if (!success) {
@@ -880,6 +978,12 @@ public class UpdatesSettings extends PreferenceActivity implements
                 .setNegativeButton(R.string.dialog_cancel, new DialogInterface.OnClickListener() {
                     @Override
                     public void onClick(DialogInterface dialog, int which) {
+                        // Do nothing and allow the dialog to be dismissed
+                    }
+                })
+                .setOnDismissListener(new DialogInterface.OnDismissListener() {
+                    @Override
+                    public void onDismiss(DialogInterface dialog) {
                         mStartUpdateVisible = false;
                     }
                 })
